@@ -166,6 +166,7 @@ class ScheduleMaker(object):
                          'gamespermatchup':int,
                          'leaguenights':_weekdayNum,
                         }
+    ERROR_ON_POOR_DISTRIBUTION = True
 
     def __init__(self, seed=DEFAULT_SEED, spreadsheetKey=SPREADSHEET_KEY):
         self.rand = random.Random()
@@ -707,7 +708,7 @@ class ScheduleMaker(object):
         between the given players
         '''
         playerPool = set(playerPool)
-        origPlayerPool = set(playerPool)
+        maxedPlayers = set()
 
         # count the total number of players that must be picked for all
         # games of the desired type - we can use this to determine the mininum
@@ -753,10 +754,13 @@ class ScheduleMaker(object):
                     # picked)
 
                     gamesRemaining = dict( (player, 0) for player in playerPool)
-                    for futureRound in xrange(roundNum + 1, max(roundSlots)):
+                    for futureRound in xrange(roundNum + 1, max(roundSlots) + 1):
                         futureMatchesLeft = roundMatchesRemain[futureRound]
                         for match in futureMatchesLeft:
-                            if match.player1 not in playerPool or match.player2 not in playerPool:
+                            if (match.player1 not in playerPool
+                                    or match.player2 not in playerPool
+                                    or match.player1 in maxedPlayers
+                                    or match.player2 in maxedPlayers):
                                 continue
                             gamesRemaining[match.player1] += 1
                             gamesRemaining[match.player2] += 1
@@ -765,7 +769,8 @@ class ScheduleMaker(object):
                     # for whom minPicks - picks >= gamesRemaining
                     requiredPlayers = set()
                     for player in playerPool:
-                        if minPicks - playerPicks[player] >= gamesRemaining[player]:
+                        if (minPicks - playerPicks[player] >= gamesRemaining[player]
+                                and player not in maxedPlayers):
                             requiredPlayers.add(player)
 
                     matchesByRequired = {}
@@ -815,8 +820,7 @@ class ScheduleMaker(object):
                     for player in (chosenMatch.player1, chosenMatch.player2):
                         picks = playerPicks[player] + 1
                         if picks == maxPicks:
-                            del playerPicks[player]
-                            playerPool.remove(player)
+                            maxedPlayers.add(player)
                         else:
                             playerPicks[player] = picks
 
@@ -824,7 +828,7 @@ class ScheduleMaker(object):
 
         # Now check that we got an even distribution
         # regenerate playerPicks "just to be certain"
-        playerPicks = dict( (x,0) for x in origPlayerPool )
+        playerPicks = dict( (x,0) for x in playerPool )
         for slots in roundSlots.itervalues():
             for slot, _ in slots:
                 if slot.group != gameType:
@@ -835,7 +839,12 @@ class ScheduleMaker(object):
         if max(playerPicks.itervalues()) - min(playerPicks.itervalues()) > 1:
             from pprint import pprint
             pprint(playerPicks)
-            raise RuntimeError("leagueNights not distributed properly")
+            msg = "%s games not distributed properly" % gameType
+            if self.ERROR_ON_POOR_DISTRIBUTION:
+                raise RuntimeError(msg)
+            else:
+                print 'WARNING!:',
+                print msg
 
     def putScheduleInGoogle(self):
         # First check if a 'schedule' worksheet exists

@@ -147,7 +147,7 @@ class Match(object):
         return data
 
 class ScheduleMaker(object):
-    DEFAULT_SEED = 0
+    DEFAULT_SEED = 1
     SPREADSHEET_KEY = r'0Aj7bwN1ZgqdVdEFWc2Z3YWZHblQ4dnNtNjZIbU1zUmc'
     CHALLONGE_TOURNAMENT_ID = 175472
     MAX_LOGIN_TRIES = 3
@@ -176,7 +176,7 @@ class ScheduleMaker(object):
                            'date':_parseDate,
                            'round':int
                           }
-    ERROR_ON_POOR_DISTRIBUTION = True
+    ERROR_ON_POOR_DISTRIBUTION = False
 
     SCHEDULE_COLUMNS = ('Date', 'Round', 'Player1', 'Player2', 'Type')
 
@@ -678,20 +678,6 @@ class ScheduleMaker(object):
                     chosenMatch = matchesLeft.pop(chosenIndex)
                     self._updateMatch(chosenMatch, slot, roundNum)
 
-        # do a sanity check on leagueNights
-        lnPicks = dict( (x,0) for x in leagueNighters )
-        for slot in allSlots:
-            if slot.group != 'leagueNight':
-                continue
-            assert len(slot.matches) == 3
-            for match in slot.matches:
-                lnPicks[match.player1] += 1
-                lnPicks[match.player2] += 1
-        if max(lnPicks.itervalues()) - min(lnPicks.itervalues()) > 1:
-            from pprint import pprint
-            pprint(lnPicks)
-            raise DistributionError("leagueNights not distributed properly")
-
         # do sanity check to ensure that everyone has played the same number
         # of games
         gamesPlayed = dict( (x,0) for x in roster )
@@ -832,20 +818,29 @@ class ScheduleMaker(object):
                     # Now, find all the remaining matches between eligible players,
                     # and sort them into lists based on the total number of picks
                     # between the two players
-                    matchesByPicks = {}
-                    for match in potentialMatches:
-                        p1Picks = playerPicks.get(match.player1, None)
-                        p2Picks = playerPicks.get(match.player2, None)
-                        if p1Picks is None or p2Picks is None:
-                            continue
-                        matchesByPicks.setdefault(p1Picks + p2Picks, []).append(match)
+                    def filterByPlayersInPool(potentialMatches):
+                        matchesByPicks = {}
+                        for match in potentialMatches:
+                            p1Picks = playerPicks.get(match.player1, None)
+                            p2Picks = playerPicks.get(match.player2, None)
+                            if p1Picks is None or p2Picks is None:
+                                continue
+                            matchesByPicks.setdefault(p1Picks + p2Picks, []).append(match)
 
-                    # If we didn't find ANY matches between eligible players, panic
-                    if not matchesByPicks:
-                        raise DistributionError("no matches left for round %d that contain players for %s matches" % (roundNum, gameType))
+                        # If we didn't find ANY matches between eligible players, panic
+                        if not matchesByPicks:
+                            raise DistributionError("no matches left for round %d that contain players for %s matches" % (roundNum, gameType))
 
-                    # otherwise, check out the minimum group
-                    potentialMatches = sorted(matchesByPicks.items())[0][1]
+                        # otherwise, check out the minimum group
+                        potentialMatches = sorted(matchesByPicks.items())[0][1]
+                        return potentialMatches
+
+                    try:
+                        potentialMatches = filterByPlayersInPool(potentialMatches)
+                    except DistributionError:
+                        if self.ERROR_ON_POOR_DISTRIBUTION:
+                            raise
+                        potentialMatches = filterByPlayersInPool(matchesLeft)
 
                     # Now do similarly to how we sorted matches by lowest
                     # number of picks earlier - except sort by future

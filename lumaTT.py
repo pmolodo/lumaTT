@@ -14,6 +14,9 @@ import gdata.spreadsheet.service
 
 class ScheduleMakerError(Exception): pass
 class WorksheetNotFoundError(ScheduleMakerError): pass
+class TimeSlotNotFoundError(ScheduleMakerError): pass
+class DistributionError(ScheduleMakerError): pass
+class SpreadsheetUpdateError(ScheduleMakerError): pass
 
 #==============================================================================
 # Utility functions
@@ -133,6 +136,15 @@ class Match(object):
         return '%s vs %s - Round %s - %s' % (self.player1, self.player2,
                                              self.round, self.dateInfoStr())
 
+    def toDict(self):
+        data = {}
+        data['Date'] = self.date.strftime('%m/%d/%Y')
+        data['Round'] = str(self.round)
+        data['Player1'] = self.player1
+        data['Player2'] = self.player2
+        group = self.slot.group
+        data['Type'] = '' if group is None else group
+        return data
 
 class ScheduleMaker(object):
     DEFAULT_SEED = 0
@@ -381,7 +393,7 @@ class ScheduleMaker(object):
                 if slot.group == row['type'] and slot.date == row['date']:
                     break
             else:
-                raise RuntimeError("could not find a time slot to match entry %r in google schedule" % row)
+                raise ScheduleMakerError("could not find a time slot to match entry %r in google schedule" % row)
             rounds.setdefault(roundNum, []).append( Match(slot,
                                                           row['player1'],
                                                           row['player2'],
@@ -678,7 +690,7 @@ class ScheduleMaker(object):
         if max(lnPicks.itervalues()) - min(lnPicks.itervalues()) > 1:
             from pprint import pprint
             pprint(lnPicks)
-            raise RuntimeError("leagueNights not distributed properly")
+            raise DistributionError("leagueNights not distributed properly")
 
         # do sanity check to ensure that everyone has played the same number
         # of games
@@ -689,7 +701,7 @@ class ScheduleMaker(object):
                 gamesPlayed[match.player2] += 1
         for player, games in gamesPlayed.iteritems():
             if games != (len(roster) - 1) * self.getSeasonData()['gamespermatchup']:
-                raise RuntimeError("player %s did not play correct number of games" % player)
+                raise DistributionError("player %s did not play correct number of games" % player)
 
         for matches in roundMatches.itervalues():
             # Now that we have dates, sort by them
@@ -702,6 +714,7 @@ class ScheduleMaker(object):
                 print match
 
         self.putScheduleInGoogle()
+        self.putPlayerSchedulesInGoogle()
 
     def _updateMatch(self, match, slot, roundNum):
         match.slot = slot
@@ -829,7 +842,7 @@ class ScheduleMaker(object):
 
                     # If we didn't find ANY matches between eligible players, panic
                     if not matchesByPicks:
-                        raise RuntimeError("no matches left for round %d that contain players for %s matches" % (roundNum, gameType))
+                        raise DistributionError("no matches left for round %d that contain players for %s matches" % (roundNum, gameType))
 
                     # otherwise, check out the minimum group
                     potentialMatches = sorted(matchesByPicks.items())[0][1]
@@ -874,10 +887,43 @@ class ScheduleMaker(object):
             pprint(playerPicks)
             msg = "%s games not distributed properly" % gameType
             if self.ERROR_ON_POOR_DISTRIBUTION:
-                raise RuntimeError(msg)
+                raise DistributionError(msg)
             else:
                 print 'WARNING!:',
                 print msg
+
+    def fillTable(self, wsKey, headers, dataRows):
+        numCols = len(headers)
+        numRows = len(dataRows) + 1
+
+        # For speed, do this using a batch request, instead of a bunch of
+        # UpdateCell or InsertRow calls
+        batchRequest = gdata.spreadsheet.SpreadsheetsCellsFeed()
+
+        query = gdata.spreadsheet.service.CellQuery()
+        query.min_col = '1'
+        query.max_col = str(numCols)
+        query.min_row = '1'
+        query.max_row = str(numRows)
+        query.return_empty = 'true'
+        cells = self.client.GetCellsFeed(self.SPREADSHEET_KEY, wksht_id=wsKey,
+                                         query=query)
+
+        def setCell(rowI, colI, val):
+            entry = cells.entry[rowI * numCols + colI]
+            entry.cell.inputValue = val
+            batchRequest.AddUpdate(entry)
+
+        for colI, header in enumerate(self.SCHEDULE_COLUMNS):
+            setCell(0, colI, header)
+
+        for rowI, row in enumerate(dataRows):
+            for colI, header in enumerate(headers):
+                setCell(rowI + 1, colI, row[header])
+
+        updated = self.client.ExecuteBatch(batchRequest, cells.GetBatchLink().href)
+        if not updated:
+            raise SpreadsheetUpdateError("Error updating spreadsheet")
 
     def putScheduleInGoogle(self):
         # First check if a 'schedule' worksheet exists
@@ -905,41 +951,11 @@ class ScheduleMaker(object):
                                  self.SPREADSHEET_KEY)
         wsKey = self.getWorksheetKey(self.SCHEDULE_WS_TITLE)
 
-        # For speed, do this using a batch request, instead of a bunch of
-        # UpdateCell or InsertRow calls
-        batchRequest = gdata.spreadsheet.SpreadsheetsCellsFeed()
-
-        query = gdata.spreadsheet.service.CellQuery()
-        query.min_col = '1'
-        query.max_col = str(numCols)
-        query.min_row = '1'
-        query.max_row = str(numRows)
-        query.return_empty = 'true'
-        cells = self.client.GetCellsFeed(self.SPREADSHEET_KEY, wksht_id=wsKey,
-                                         query=query)
-
-        def setCell(rowI, colI, val):
-            entry = cells.entry[rowI * numCols + colI]
-            entry.cell.inputValue = val
-            batchRequest.AddUpdate(entry)
-
-        for colI, header in enumerate(self.SCHEDULE_COLUMNS):
-            setCell(0, colI, header)
-
-        rowI = 1
+        dataRows = []
         for roundNum in sorted(roundMatches):
             for match in roundMatches[roundNum]:
-                setCell(rowI, 0, match.date.strftime('%m/%d/%Y'))
-                setCell(rowI, 1, str(match.round))
-                setCell(rowI, 2, match.player1)
-                setCell(rowI, 3, match.player2)
-                group = match.slot.group
-                setCell(rowI, 4, '' if group is None else group)
-                rowI += 1
-
-        updated = self.client.ExecuteBatch(batchRequest, cells.GetBatchLink().href)
-        if not updated:
-            raise RuntimeError("Error updating schedule spreadsheet")
+                dataRows.append(match.toDict())
+        self.fillTable(wsKey, self.SCHEDULE_COLUMNS, dataRows)
 
     def getPlayerSchedules(self):
         roster = self.getRoster()
@@ -951,7 +967,22 @@ class ScheduleMaker(object):
                 playerSchedules[match.player2].append(match)
         return playerSchedules
 
+    def putPlayerSchedulesInGoogle(self):
+        for player, matches in self.getPlayerSchedules().iteritems():
+            title = '%s - %s' % (self.SCHEDULE_WS_TITLE, player)
+            numCols = len(self.SCHEDULE_COLUMNS)
+            numRows = len(matches) + 1
+            try:
+                wsKey = self.getWorksheetKey(title)
+            except WorksheetNotFoundError:
+                self.client.AddWorksheet(title,
+                         numRows,
+                         numCols,
+                         self.SPREADSHEET_KEY)
+                wsKey = self.getWorksheetKey(title)
 
+            self.fillTable(wsKey, self.SCHEDULE_COLUMNS,
+                           [x.toDict() for x in matches])
 
 if __name__ == '__main__':
     # run a test

@@ -5,6 +5,8 @@ import datetime
 import collections
 import itertools
 
+import enum
+
 import challonge
 
 import gdata.service
@@ -31,22 +33,14 @@ def boolstr(inputStr):
         return True
     return bool(int(inputStr))
 
-class Availability(object):
-    def __init__(self, val):
-        self.val = val
+Availability = enum.Enum('hitMax', 'hitMin', 'underMin')
+HIT_MAX = Availability.hitMax
+HIT_MIN = Availability.hitMin
+UNDER_MIN = Availability.underMin
 
-    def __cmp__(self, other):
-        if not isinstance(other, Availability):
-            return NotImplemented
-        return cmp(self.val, other.val)
-
-    def __nonzero__(self):
-        return self.val > 0
-
-
-UNDER_MIN = Availability(2)
-HIT_MIN = Availability(1)
-HIT_MAX = Availability(0)
+Services = enum.Enum('google', 'challonge')
+GOOGLE = Services.google
+CHALLONGE = Services.challonge
 
 class DayData(object):
     def __init__(self, date, group=None, matches=None, minGames=None,
@@ -146,7 +140,7 @@ class ScheduleMaker(object):
     CHALLONGE_TOURNAMENT_ID = 175472
     MAX_LOGIN_TRIES = 3
 
-    GAMES_PER_LEAGUE_NIGHT = 0
+    GAMES_PER_LEAGUE_NIGHT = 1
     GAMES_PER_LUNCH = 1
 
     # titles of worksheets
@@ -166,7 +160,13 @@ class ScheduleMaker(object):
                          'gamespermatchup':int,
                          'leaguenights':_weekdayNum,
                         }
+    SCHEDULE_DATA_TYPES = {
+                           'date':_parseDate,
+                           'round':int
+                          }
     ERROR_ON_POOR_DISTRIBUTION = True
+
+    SCHEDULE_COLUMNS = ('Date', 'Round', 'Player1', 'Player2', 'Type')
 
     def __init__(self, seed=DEFAULT_SEED, spreadsheetKey=SPREADSHEET_KEY):
         self.rand = random.Random()
@@ -279,6 +279,17 @@ class ScheduleMaker(object):
         else:
             return self._roster
 
+    def getSeasonData(self):
+        if getattr(self, '_seasonData', None) is None:
+            seasonData = self.getWorksheetRows(self.SEASON_DATA_WS_TITLE,
+                                               types=self.SEASON_DATA_TYPES)
+            self._seasonData = seasonData[0]
+        return self._seasonData
+
+    def getSchedule(self):
+        scheduleRows = self.getWorksheetRows(title=self.SCHEDULE_WS_TITLE)
+
+
     def idToPlayer(self, challongeId):
         if not hasattr(self, '_idToPlayer'):
             self._idToPlayer = dict( (player['challongeid'], player) for player in self.getRoster().itervalues())
@@ -305,13 +316,6 @@ class ScheduleMaker(object):
                 gPlayerRow['challongeid'] = str(cPlayer['id'])
                 print gPlayerRow
                 self.client.UpdateRow(gPlayer, gPlayerRow)
-
-    def getSeasonData(self):
-        if getattr(self, '_seasonData', None) is None:
-            seasonData = self.getWorksheetRows(self.SEASON_DATA_WS_TITLE,
-                                               types=self.SEASON_DATA_TYPES)
-            self._seasonData = seasonData[0]
-        return self._seasonData
 
     def getTimeSlots(self):
         if getattr(self, '_slots', None) is None:
@@ -342,18 +346,47 @@ class ScheduleMaker(object):
             self._slots = slots
         return self._slots
 
-    def getRoundMatches(self):
-        self.setChallongeLogPw()
-        if getattr(self, '_rounds', None) is None:
-            matches = challonge.matches.index(self.CHALLONGE_TOURNAMENT_ID)
-            rounds = {}
-            for match in matches:
-                roundNum = match['round']
-                rounds.setdefault(roundNum, []).append( Match(None,
-                                                              self.idToPlayer(match['player1-id'])['name'],
-                                                              self.idToPlayer(match['player2-id'])['name']))
+    def getRoundMatches(self, service=CHALLONGE, cached=True):
+        if not (isinstance(service, enum.EnumValue)
+                and service.enumtype == Services):
+            raise TypeError(service)
+        if not cached or getattr(self, '_rounds', None) is None:
+            if service == CHALLONGE:
+                rounds = self.getChallongeMatches()
+            elif service == GOOGLE:
+                rounds = self.getGoogleMatches()
+            else:
+                raise ValueError(service)
             self._rounds = rounds
         return self._rounds
+
+    def getChallongeMatches(self):
+        self.setChallongeLogPw()
+        matches = challonge.matches.index(self.CHALLONGE_TOURNAMENT_ID)
+        rounds = {}
+        for match in matches:
+            roundNum = match['round']
+            rounds.setdefault(roundNum, []).append( Match(None,
+                                                          self.idToPlayer(match['player1-id'])['name'],
+                                                          self.idToPlayer(match['player2-id'])['name']))
+        return rounds
+
+    def getGoogleMatches(self):
+        rounds = {}
+        allSlots = self.getTimeSlots()
+        for row in self.getWorksheetRows(title=self.SCHEDULE_WS_TITLE,
+                                         types=self.SCHEDULE_DATA_TYPES):
+            roundNum = row['round']
+            for slot in allSlots:
+                if slot.group == row['type'] and slot.date == row['date']:
+                    break
+            else:
+                raise RuntimeError("could not find a time slot to match entry %r in google schedule" % row)
+            rounds.setdefault(roundNum, []).append( Match(slot,
+                                                          row['player1'],
+                                                          row['player2'],
+                                                          round=roundNum))
+        return rounds
 
     def makeSchedule(self):
         timeSlots = {UNDER_MIN:[],
@@ -861,8 +894,7 @@ class ScheduleMaker(object):
                 name = '%s %d' % (basename, num)
             self.renameWorksheet(self.SCHEDULE_WS_TITLE, name)
 
-        scheduleColumns = ('Date', 'Round', 'Player1', 'Player2', 'Type')
-        numCols = len(scheduleColumns)
+        numCols = len(self.SCHEDULE_COLUMNS)
 
         roundMatches = self.getRoundMatches()
         numMatches = sum(len(matches) for matches in roundMatches.itervalues())
@@ -891,7 +923,7 @@ class ScheduleMaker(object):
             entry.cell.inputValue = val
             batchRequest.AddUpdate(entry)
 
-        for colI, header in enumerate(scheduleColumns):
+        for colI, header in enumerate(self.SCHEDULE_COLUMNS):
             setCell(0, colI, header)
 
         rowI = 1
@@ -909,9 +941,20 @@ class ScheduleMaker(object):
         if not updated:
             raise RuntimeError("Error updating schedule spreadsheet")
 
+    def getPlayerSchedules(self):
+        roster = self.getRoster()
+        playerSchedules = dict( (player, []) for player in roster)
+        roundMatches = self.getRoundMatches()
+        for roundNum in sorted(roundMatches):
+            for match in roundMatches[roundNum]:
+                playerSchedules[match.player1].append(match)
+                playerSchedules[match.player2].append(match)
+        return playerSchedules
+
+
+
 if __name__ == '__main__':
     # run a test
-    import lumaTT
-    sm = lumaTT.ScheduleMaker()
+    sm = ScheduleMaker()
     sm.makeSchedule()
 

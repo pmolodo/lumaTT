@@ -5,6 +5,7 @@ import datetime
 import collections
 import itertools
 import time
+import urllib
 
 import enum
 
@@ -20,12 +21,64 @@ class WorksheetNotFoundError(ScheduleMakerError): pass
 class TimeSlotNotFoundError(ScheduleMakerError): pass
 class DistributionError(ScheduleMakerError): pass
 class SpreadsheetUpdateError(ScheduleMakerError): pass
+class CalendarError(ScheduleMakerError): pass
 
+
+#==============================================================================
+# Local time crap
+#==============================================================================
+
+STDOFFSET = datetime.timedelta(seconds = -time.timezone)
+if time.daylight:
+    DSTOFFSET = datetime.timedelta(seconds = -time.altzone)
+else:
+    DSTOFFSET = STDOFFSET
+
+ZERO = datetime.timedelta(0)
+DSTDIFF = DSTOFFSET - STDOFFSET
+
+class LocalTimezone(datetime.tzinfo):
+
+    def utcoffset(self, dt):
+        if self._isdst(dt):
+            return DSTOFFSET
+        else:
+            return STDOFFSET
+
+    def dst(self, dt):
+        if self._isdst(dt):
+            return DSTDIFF
+        else:
+            return ZERO
+
+    def tzname(self, dt):
+        return time.tzname[self._isdst(dt)]
+
+    def _isdst(self, dt):
+        tt = (dt.year, dt.month, dt.day,
+              dt.hour, dt.minute, dt.second,
+              dt.weekday(), 0, 0)
+        stamp = time.mktime(tt)
+        tt = time.localtime(stamp)
+        return tt.tm_isdst > 0
+
+Local = LocalTimezone()
 #==============================================================================
 # Utility functions
 #==============================================================================
-def _parseDate(dateString):
+def str2date(dateString):
     return datetime.datetime.strptime(dateString, '%m/%d/%Y').date()
+
+#CAL_DATETIME_FORMAT = '%Y-%m-%dT%H:%M:%S.000Z'
+CAL_DATETIME_FORMAT = '%Y-%m-%dT%H:%M:%S'
+
+def datetime2str(datetimeObj):
+    if isinstance(datetimeObj, (float, int, long)):
+        return datetime2str(time.gmtime(datetimeObj))
+    elif isinstance(datetimeObj, time.struct_time):
+        return time.strftime(CAL_DATETIME_FORMAT, datetimeObj)
+    elif isinstance(datetimeObj, datetime.datetime):
+        return datetimeObj.strftime(CAL_DATETIME_FORMAT)
 
 def _weekdayNum(dayString):
     return ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
@@ -46,6 +99,7 @@ def bool2str(inputBool):
     if inputBool:
         return 'true'
     return 'false'
+
 
 Availability = enum.Enum('hitMax', 'hitMin', 'underMin')
 HIT_MAX = Availability.hitMax
@@ -178,18 +232,25 @@ class ScheduleMaker(object):
                         }
 
     SEASON_DATA_TYPES = {
-                         'startdate':_parseDate,
-                         'enddate':_parseDate,
+                         'startdate':str2date,
+                         'enddate':str2date,
                          'gamespermatchup':int,
                          'leaguenights':_weekdayNum,
                         }
     SCHEDULE_DATA_TYPES = {
-                           'date':_parseDate,
+                           'date':str2date,
                            'round':int
                           }
     ERROR_ON_POOR_DISTRIBUTION = False
 
     SCHEDULE_COLUMNS = ('Date', 'Round', 'Player1', 'Player2', 'Type')
+    MATCH_TIMES = {None: (datetime.time(9), datetime.time(19)),
+                   'lunch': (datetime.time(12, 30), datetime.time(13)),
+                   'leagueNight': (datetime.time(19), datetime.time(20)),
+                  }
+
+    CALENDAR_TITLE = 'Luma Table Tennis'
+
 
     def __init__(self, seed=DEFAULT_SEED, spreadsheetKey=SPREADSHEET_KEY):
         self.rand = random.Random()
@@ -990,6 +1051,87 @@ class ScheduleMaker(object):
             self.fillTable(wsKey, self.SCHEDULE_COLUMNS,
                            [x.toDict() for x in matches])
 
+    @property
+    def _calendars(self):
+        if getattr(self, '_calendarInterface', None) is None:
+            self._calendarInterface = CalendarInterface(*self.getGoogleLogPw())
+        return self._calendarInterface
+
+    def makeCalendars(self):
+        allCal = self._getAllCalendar()
+        playerCals = self._getPlayerCalendars()
+
+        sleepTime = 10
+        print "sleeping %s seconds after creating calendars..." % sleepTime
+        time.sleep(sleepTime)
+        print "...done sleeping"
+
+        allBatchFeed = gdata.calendar.data.CalendarEventFeed()
+        playerBatchFeeds = {}
+        playerCalEmails = {}
+        for player in playerCals:
+            playerBatchFeeds[player] = gdata.calendar.data.CalendarEventFeed()
+            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
+                continue
+            playerCalEmails[player] = urllib.unquote(self._calendars._calObjToKey(playerCals[player]))
+
+        for matches in self.getRoundMatches().itervalues():
+            for match in matches:
+                start, end = self.MATCH_TIMES[match.slot.group]
+                start_time = datetime2str(datetime.datetime.combine(match.slot.date, start))
+                end_time = datetime2str(datetime.datetime.combine(match.slot.date, end))
+                invitees = []
+                for player in (match.player1, match.player2):
+                    if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
+                        continue
+                    invitees.append(playerCalEmails[player])
+                title = '%s vs %s (R%d)' % (match.player1, match.player2, match.rouind)
+                self._calendars._InsertEvent(title,
+                                             content='Round %d matchup between %s and %s' % (match.round, match.player1, match.player2),
+                                             start_time=start_time,
+                                             end_time=end_time,
+                                             guests_can_modify=True,
+                                             invitees=invitees,
+                                             batchFeed=allBatchFeed)
+
+        allBatchUri = self._calendars._getCalBatchUri(allCal)
+        self._calendars.cal_client.ExecuteBatch(allBatchFeed, allBatchUri)
+
+    def _getAllCalendar(self):
+        cal = self._calendars._calTitleToObj(self.CALENDAR_TITLE)
+        if cal is not None:
+            return cal
+        return self._createAllCalendar()
+
+    def _createAllCalendar(self):
+        return self._calendars._InsertCalendar(self.CALENDAR_TITLE,
+                                               description='Schedule of matches for the Luma Table Tennis League',
+                                               location='Santa Monica')
+
+    def _getPlayerCalendars(self):
+        calendars = {}
+        for player in self.getRoster():
+            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
+                continue
+            calendars[player] = self._getPlayerCalendar(player)
+        return calendars
+
+    def _getPlayerCalendar(self, player):
+        title = '%s (%s)' % (self.CALENDAR_TITLE, player)
+        cal = self._calendars._calTitleToObj(title)
+        if cal is not None:
+            return cal
+        return self._createPlayerCalendar(player)
+
+
+    def _createPlayerCalendar(self, player):
+        title = '%s (%s)' % (self.CALENDAR_TITLE, player)
+        return self._calendars._InsertCalendar(title,
+                                               description="Schedule of %s's matches for the Luma Table Tennis League" % player,
+                                               location='Santa Monica',
+                                               color='#8C500B')
+
+
 # Much of this code adapted from the official gdata caldender example,
 # http://code.google.com/p/gdata-python-client/source/browse/samples/calendar/calendarExample.py
 class CalendarInterface(object):
@@ -1017,30 +1159,51 @@ class CalendarInterface(object):
         new_calendar = self.cal_client.InsertCalendar(new_calendar=calendar)
         return new_calendar
 
-    def _getCalFeedUri(self, calendar):
-        if 'http' in calendar:
-            return calendar
-        elif '@group.calendar.com' in calendar:
-            key = calendar
-        else:
-            key = self._getCalKey(calendar)
+    @classmethod
+    def _calObjToKey(cls, calendar):
+        return cls._calUrlToKey(calendar.id.text)
+
+    @classmethod
+    def _calUrlToKey(cls, url):
+        return url.rsplit('/', 1)[-1]
+
+    def _getCalUri(self, calendar):
+        key = self._getCalKey(calendar)
         return self.cal_client.get_calendar_event_feed_uri(calendar=key)
 
+    def _getCalBatchUri(self, calendar):
+        key = self._getCalKey(calendar)
+        return 'http://www.google.com/calendar/feeds/%s/private/full/batch' % key
+
     def _getCalKey(self, calendar, refresh=False):
-        return self._calTitleToKey(refresh=refresh)[calendar]
+        if isinstance(calendar, gdata.calendar.data.CalendarEntry):
+            calendar = calendar.id.text
+        if 'http' in calendar:
+            return self._calUrlToKey(calendar)
+        elif '@group.calendar.com' in calendar:
+            return calendar
+        else:
+            return self._calTitleToKey(refresh=refresh)[calendar]
 
     def _calTitleToKey(self, refresh=False):
         if refresh or getattr(self, '_calTitleToKeyDict', None) is None:
             title2Key = {}
             for cal in self.cal_client.GetOwnCalendarsFeed().entry:
-                title2Key[cal.title.text] = cal.id.text.rsplit('/', 1)[-1]
+                title2Key[cal.title.text] = self._calObjToKey(cal)
             self._calTitleToKeyDict = title2Key
         return self._calTitleToKeyDict
+
+    def _calTitleToObj(self, title):
+        for cal in self.cal_client.GetOwnCalendarsFeed().entry:
+            if cal.title.text == title:
+                return cal
 
     def _InsertEvent(self, title, calendar=None,
                      content=None, where=None,
                      start_time=None, end_time=None, recurrence_data=None,
-                     guests_can_modify=False):
+                     guests_can_modify=False,
+                     invitees=None,
+                     batchFeed=None, batchId=None):
         """Inserts a basic event using either start_time/end_time definitions
         or gd:recurrence RFC2445 icalendar syntax.  Specifying both types of
         dates is not valid.  Note how some members of the CalendarEventEntry
@@ -1066,22 +1229,37 @@ class CalendarInterface(object):
         else:
             if start_time is None:
                 # Use current time for the start_time and have the event last 1 hour
-                start_time = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-                end_time = time.strftime('%Y-%m-%dT%H:%M:%S.000Z',
-                                         time.gmtime(time.time() + 3600))
+                start_time = datetime2str(time.gmtime())
+                end_time = datetime2str(time.gmtime(time.time() + 3600))
             event.when.append(gdata.data.When(start=start_time,
                                               end=end_time))
 
         event.guests_can_modify = gdata.calendar.data.GuestsCanModifyProperty(value=bool2str(guests_can_modify))
 
-        if calendar is None:
-            insert_uri = None
+        if invitees:
+            for invitee in invitees:
+#                if not isinstance(invitee, gdata.calendar.Who):
+#                    invitee = gdata.calendar.Who(email=invitee)
+                if not isinstance(invitee, gdata.data.Who):
+                    invitee = gdata.data.Who(email=invitee)
+                event.who.append(invitee)
+
+        if batchFeed:
+            if calendar is not None:
+                raise CalendarError("May not specify a calendar when inserting using a batch feed (calendar is specified when batch feed is executed)")
+            if batchId is None:
+                batchId = 'insert-event: %s' % title
+            if not isinstance(batchId, gdata.data.BatchId):
+                batchId = gdata.data.BatchId(text=batchId)
+            event.batch_id = batchId
+            batchFeed.AddInsert(entry=event)
+            return batchId
         else:
-            insert_uri = self._getCalFeedUri(calendar)
-
-        new_event = self.cal_client.InsertEvent(event, insert_uri=insert_uri)
-
-        return new_event
+            if calendar is None:
+                insert_uri = None
+            else:
+                insert_uri = self._getCalUri(calendar)
+            return self.cal_client.InsertEvent(event, insert_uri=insert_uri)
 
     def _InsertSingleEvent(self, title, **kwargs):
         """Uses the _InsertEvent helper method to insert a single event which

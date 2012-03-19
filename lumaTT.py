@@ -772,7 +772,8 @@ class ScheduleMaker(object):
                 print match
 
         self.putScheduleInGoogle()
-        self.putPlayerSchedulesInGoogle()
+        #self.putPlayerSchedulesInGoogle()
+        self.makeCalendars()
 
     def _updateMatch(self, match, slot, roundNum):
         match.slot = slot
@@ -1067,12 +1068,10 @@ class ScheduleMaker(object):
         print "...done sleeping"
 
         allBatchFeed = gdata.calendar.data.CalendarEventFeed()
-        playerBatchFeeds = {}
         playerCalEmails = {}
         for player in playerCals:
-            playerBatchFeeds[player] = gdata.calendar.data.CalendarEventFeed()
-            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
-                continue
+#            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
+#                continue
             playerCalEmails[player] = urllib.unquote(self._calendars._calObjToKey(playerCals[player]))
 
         for matches in self.getRoundMatches().itervalues():
@@ -1082,8 +1081,8 @@ class ScheduleMaker(object):
                 end_time = datetime2str(datetime.datetime.combine(match.slot.date, end))
                 invitees = []
                 for player in (match.player1, match.player2):
-                    if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
-                        continue
+#                    if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
+#                        continue
                     invitees.append(playerCalEmails[player])
                 title = '%s vs %s (R%d)' % (match.player1, match.player2, match.rouind)
                 self._calendars._InsertEvent(title,
@@ -1091,11 +1090,20 @@ class ScheduleMaker(object):
                                              start_time=start_time,
                                              end_time=end_time,
                                              guests_can_modify=True,
-                                             invitees=invitees,
                                              batchFeed=allBatchFeed)
 
-        allBatchUri = self._calendars._getCalBatchUri(allCal)
+        allBatchUri = self._calendars._getCalFeedUri(allCal, batch=True)
         self._calendars.cal_client.ExecuteBatch(allBatchFeed, allBatchUri)
+
+        # sometimes for an event, the player cal will get added to the invite
+        # list on the main cal, but the event won't get added to the per-player
+        # cal properly
+        # check for / fix this...
+        # ...maybe it gets updated if given time?
+#        for player, playerCal in playerCals.iteritems():
+#            mainCalEvents = self._calendars._getEventsTextQuery(allCal, player)
+#            playerCalEvents = self._calendars._getEvents(playerCal)
+
 
     def _getAllCalendar(self):
         cal = self._calendars._calTitleToObj(self.CALENDAR_TITLE)
@@ -1111,8 +1119,8 @@ class ScheduleMaker(object):
     def _getPlayerCalendars(self):
         calendars = {}
         for player in self.getRoster():
-            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
-                continue
+#            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
+#                continue
             calendars[player] = self._getPlayerCalendar(player)
         return calendars
 
@@ -1171,9 +1179,12 @@ class CalendarInterface(object):
         key = self._getCalKey(calendar)
         return self.cal_client.get_calendar_event_feed_uri(calendar=key)
 
-    def _getCalBatchUri(self, calendar):
+    def _getCalFeedUri(self, calendar, batch=False):
         key = self._getCalKey(calendar)
-        return 'http://www.google.com/calendar/feeds/%s/private/full/batch' % key
+        uri = 'http://www.google.com/calendar/feeds/%s/private/full' % key
+        if batch:
+            uri += '/batch'
+        return uri
 
     def _getCalKey(self, calendar, refresh=False):
         if isinstance(calendar, gdata.calendar.data.CalendarEntry):
@@ -1197,6 +1208,22 @@ class CalendarInterface(object):
         for cal in self.cal_client.GetOwnCalendarsFeed().entry:
             if cal.title.text == title:
                 return cal
+
+    def _getEvents(self, cal, **kwargs):
+        """In reality, the server limits the result set intially returned.  You can
+        use the max_results query parameter to allow the server to send additional
+        results back (see query parameter use in DateRangeQuery for more info).
+        Additionally, you can page through the results returned by using the
+        feed.GetNextLink().href value to get the location of the next set of
+        results."""
+        if 'q' not in kwargs:
+            query = gdata.calendar.client.CalendarEventQuery(max_results=100)
+            kwargs['q'] = query
+        return self.cal_client.get_calendar_event_feed(uri=self._getCalFeedUri(cal), **kwargs).entry
+
+    def _getEventsTextQuery(self, cal, text):
+        query = gdata.calendar.client.CalendarEventQuery(text_query=text, max_results=100)
+        return self._getEvents(cal, q=query)
 
     def _InsertEvent(self, title, calendar=None,
                      content=None, where=None,

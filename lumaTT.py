@@ -4,13 +4,16 @@ import getpass
 import datetime
 import collections
 import itertools
+import time
 
 import enum
 
 import challonge
 
+import atom
 import gdata.service
 import gdata.spreadsheet.service
+import gdata.calendar.client
 
 class ScheduleMakerError(Exception): pass
 class WorksheetNotFoundError(ScheduleMakerError): pass
@@ -28,13 +31,21 @@ def _weekdayNum(dayString):
     return ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
             'sunday'].index(dayString.lower())
 
-def boolstr(inputStr):
+_TRUE_STR_VALS = ('true', 'yes', '+')
+_FALSE_STR_VALS = ('false', 'no', 'nil', 'null', 'none', '-')
+
+def str2bool(inputStr):
     inputStr = inputStr.lower()
-    if inputStr in ('false', 'no', 'nil', 'null', 'none', '-'):
+    if inputStr in _FALSE_STR_VALS:
         return False
-    elif inputStr in ('true', 'yes', '+'):
+    elif inputStr in _TRUE_STR_VALS:
         return True
     return bool(int(inputStr))
+
+def bool2str(inputBool):
+    if inputBool:
+        return 'true'
+    return 'false'
 
 Availability = enum.Enum('hitMax', 'hitMin', 'underMin')
 HIT_MAX = Availability.hitMax
@@ -162,8 +173,8 @@ class ScheduleMaker(object):
 
     ROSTER_DATA_TYPES = {
                          'challongeid':int,
-                         'leaguenight':boolstr,
-                         'lunch':boolstr,
+                         'leaguenight':str2bool,
+                         'lunch':str2bool,
                         }
 
     SEASON_DATA_TYPES = {
@@ -978,6 +989,110 @@ class ScheduleMaker(object):
 
             self.fillTable(wsKey, self.SCHEDULE_COLUMNS,
                            [x.toDict() for x in matches])
+
+# Much of this code adapted from the official gdata caldender example,
+# http://code.google.com/p/gdata-python-client/source/browse/samples/calendar/calendarExample.py
+class CalendarInterface(object):
+    def __init__(self, email, password):
+        self.cal_client = gdata.calendar.client.CalendarClient(source='Google-Calendar_Python_Sample-1.0')
+        self.cal_client.ClientLogin(email, password, self.cal_client.source)
+
+    # default color is orange-ish
+    def _InsertCalendar(self, title,
+                        description='',
+                        time_zone='America/Los_Angeles', hidden=False,
+                        location=None,
+                        color='#875509'):
+        """Creates a new calendar using the specified data."""
+        print 'Creating new calendar with title "%s"' % title
+        calendar = gdata.calendar.data.CalendarEntry()
+        calendar.title = atom.data.Title(text=title)
+        calendar.summary = atom.data.Summary(text=description)
+        if location:
+            calendar.where.append(gdata.calendar.data.CalendarWhere(value=location))
+        calendar.color = gdata.calendar.data.ColorProperty(value=color)
+        calendar.timezone = gdata.calendar.data.TimeZoneProperty(value=time_zone)
+
+        calendar.hidden = gdata.calendar.data.HiddenProperty(value=bool2str(hidden))
+        new_calendar = self.cal_client.InsertCalendar(new_calendar=calendar)
+        return new_calendar
+
+    def _getCalFeedUri(self, calendar):
+        if 'http' in calendar:
+            return calendar
+        elif '@group.calendar.com' in calendar:
+            key = calendar
+        else:
+            key = self._getCalKey(calendar)
+        return self.cal_client.get_calendar_event_feed_uri(calendar=key)
+
+    def _getCalKey(self, calendar, refresh=False):
+        return self._calTitleToKey(refresh=refresh)[calendar]
+
+    def _calTitleToKey(self, refresh=False):
+        if refresh or getattr(self, '_calTitleToKeyDict', None) is None:
+            title2Key = {}
+            for cal in self.cal_client.GetOwnCalendarsFeed().entry:
+                title2Key[cal.title.text] = cal.id.text.rsplit('/', 1)[-1]
+            self._calTitleToKeyDict = title2Key
+        return self._calTitleToKeyDict
+
+    def _InsertEvent(self, title, calendar=None,
+                     content=None, where=None,
+                     start_time=None, end_time=None, recurrence_data=None,
+                     guests_can_modify=False):
+        """Inserts a basic event using either start_time/end_time definitions
+        or gd:recurrence RFC2445 icalendar syntax.  Specifying both types of
+        dates is not valid.  Note how some members of the CalendarEventEntry
+        class use arrays and others do not.  Members which are allowed to occur
+        more than once in the calendar or GData "kinds" specifications are stored
+        as arrays.  Even for these elements, Google Calendar may limit the number
+        stored to 1.  The general motto to use when working with the Calendar data
+        API is that functionality not available through the GUI will not be
+        available through the API.  Please see the GData Event "kind" document:
+        http://code.google.com/apis/gdata/elements.html#gdEventKind
+        for more information"""
+
+        event = gdata.calendar.data.CalendarEventEntry()
+        event.title = atom.data.Title(text=title)
+        if content:
+            event.content = atom.data.Content(text=content)
+        if where:
+            event.where.append(gdata.data.Where(value=where))
+
+        if recurrence_data is not None:
+            # Set a recurring event
+            event.recurrence = gdata.data.Recurrence(text=recurrence_data)
+        else:
+            if start_time is None:
+                # Use current time for the start_time and have the event last 1 hour
+                start_time = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                end_time = time.strftime('%Y-%m-%dT%H:%M:%S.000Z',
+                                         time.gmtime(time.time() + 3600))
+            event.when.append(gdata.data.When(start=start_time,
+                                              end=end_time))
+
+        event.guests_can_modify = gdata.calendar.data.GuestsCanModifyProperty(value=bool2str(guests_can_modify))
+
+        if calendar is None:
+            insert_uri = None
+        else:
+            insert_uri = self._getCalFeedUri(calendar)
+
+        new_event = self.cal_client.InsertEvent(event, insert_uri=insert_uri)
+
+        return new_event
+
+    def _InsertSingleEvent(self, title, **kwargs):
+        """Uses the _InsertEvent helper method to insert a single event which
+          does not have any recurrence syntax specified."""
+
+        new_event = self._InsertEvent(title, recurrence_data=None, **kwargs)
+
+        print 'New single event inserted: %s' % (new_event.id.text,)
+        print '\tEvent edit URL: %s' % (new_event.GetEditLink().href,)
+        print '\tEvent HTML URL: %s' % (new_event.GetHtmlLink().href,)
+        return new_event
 
 if __name__ == '__main__':
     # run a test

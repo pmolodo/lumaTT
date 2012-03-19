@@ -1062,10 +1062,10 @@ class ScheduleMaker(object):
         allCal = self._getAllCalendar()
         playerCals = self._getPlayerCalendars()
 
-        sleepTime = 10
-        print "sleeping %s seconds after creating calendars..." % sleepTime
-        time.sleep(sleepTime)
-        print "...done sleeping"
+#        sleepTime = 10
+#        print "sleeping %s seconds after creating calendars..." % sleepTime
+#        time.sleep(sleepTime)
+#        print "...done sleeping"
 
         allBatchFeed = gdata.calendar.data.CalendarEventFeed()
         playerCalEmails = {}
@@ -1084,12 +1084,13 @@ class ScheduleMaker(object):
 #                    if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
 #                        continue
                     invitees.append(playerCalEmails[player])
-                title = '%s vs %s (R%d)' % (match.player1, match.player2, match.rouind)
+                title = '%s vs %s (R%d)' % (match.player1, match.player2, match.round)
                 self._calendars._InsertEvent(title,
                                              content='Round %d matchup between %s and %s' % (match.round, match.player1, match.player2),
                                              start_time=start_time,
                                              end_time=end_time,
                                              guests_can_modify=True,
+                                             invitees=invitees,
                                              batchFeed=allBatchFeed)
 
         allBatchUri = self._calendars._getCalFeedUri(allCal, batch=True)
@@ -1105,29 +1106,33 @@ class ScheduleMaker(object):
 #            playerCalEvents = self._calendars._getEvents(playerCal)
 
 
-    def _getAllCalendar(self):
+    def _getAllCalendar(self, clear=True):
         cal = self._calendars._calTitleToObj(self.CALENDAR_TITLE)
         if cal is not None:
+            if clear:
+                self._calendars._clearEvents(cal)
             return cal
         return self._createAllCalendar()
 
-    def _createAllCalendar(self):
+    def _createAllCalendar(self, clear=True):
         return self._calendars._InsertCalendar(self.CALENDAR_TITLE,
                                                description='Schedule of matches for the Luma Table Tennis League',
                                                location='Santa Monica')
 
-    def _getPlayerCalendars(self):
+    def _getPlayerCalendars(self, clear=True):
         calendars = {}
         for player in self.getRoster():
 #            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
 #                continue
-            calendars[player] = self._getPlayerCalendar(player)
+            calendars[player] = self._getPlayerCalendar(player, clear=clear)
         return calendars
 
-    def _getPlayerCalendar(self, player):
+    def _getPlayerCalendar(self, player, clear=True):
         title = '%s (%s)' % (self.CALENDAR_TITLE, player)
         cal = self._calendars._calTitleToObj(title)
         if cal is not None:
+            if clear:
+                self._calendars._clearEvents(cal)
             return cal
         return self._createPlayerCalendar(player)
 
@@ -1217,13 +1222,27 @@ class CalendarInterface(object):
         feed.GetNextLink().href value to get the location of the next set of
         results."""
         if 'q' not in kwargs:
-            query = gdata.calendar.client.CalendarEventQuery(max_results=100)
+            query = gdata.calendar.client.CalendarEventQuery(max_results=1000)
             kwargs['q'] = query
         return self.cal_client.get_calendar_event_feed(uri=self._getCalFeedUri(cal), **kwargs).entry
 
     def _getEventsTextQuery(self, cal, text):
-        query = gdata.calendar.client.CalendarEventQuery(text_query=text, max_results=100)
+        query = gdata.calendar.client.CalendarEventQuery(text_query=text, max_results=1000)
         return self._getEvents(cal, q=query)
+
+    def _clearEvents(self, cal):
+        while True:
+            batchFeed = gdata.calendar.data.CalendarEventFeed()
+            events = self._getEvents(cal)
+            if not events:
+                break
+            for event in events:
+                event.batch_id = gdata.data.BatchId(text='delete-request')
+                # add the delete entry to the batch feed
+                batchFeed.AddDelete(entry=event)
+                #self.cal_client.Delete(event.GetEditLink().href)
+            batchUri = self._getCalFeedUri(cal, batch=True)
+            self.cal_client.ExecuteBatch(batchFeed, batchUri)
 
     def _InsertEvent(self, title, calendar=None,
                      content=None, where=None,

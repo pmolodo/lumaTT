@@ -1059,8 +1059,8 @@ class ScheduleMaker(object):
         return self._calendarInterface
 
     def makeCalendars(self):
-        allCal = self._getAllCalendar()
-        playerCals = self._getPlayerCalendars()
+        allCal = self._getAllCalendar(clear=True)
+        playerCals = self._getPlayerCalendars(clear=True)
 
 #        sleepTime = 10
 #        print "sleeping %s seconds after creating calendars..." % sleepTime
@@ -1096,17 +1096,54 @@ class ScheduleMaker(object):
         allBatchUri = self._calendars._getCalFeedUri(allCal, batch=True)
         self._calendars.cal_client.ExecuteBatch(allBatchFeed, allBatchUri)
 
+        self.fixMissingInvites()
+    
+    def fixMissingInvites(self):
+        while(self._fixMissingInvites()):
+            pass
+    
+    def _fixMissingInvites(self):
+        allCal = self._getAllCalendar()
+        playerCals = self._getPlayerCalendars()
+        playerCalEmails = {}
+        for player in playerCals:
+            playerCalEmails[player] = urllib.unquote(self._calendars._calObjToKey(playerCals[player]))
+
         # sometimes for an event, the player cal will get added to the invite
         # list on the main cal, but the event won't get added to the per-player
         # cal properly
         # check for / fix this...
-        # ...maybe it gets updated if given time?
-#        for player, playerCal in playerCals.iteritems():
-#            mainCalEvents = self._calendars._getEventsTextQuery(allCal, player)
-#            playerCalEvents = self._calendars._getEvents(playerCal)
-
-
-    def _getAllCalendar(self, clear=True):
+        removeInvitesBatch = gdata.calendar.data.CalendarEventFeed()
+        toAdd = []
+        for player, playerCal in playerCals.iteritems():
+            mainCalEvents = self._calendars._getEventsTextQuery(allCal, player)
+            playerCalEvents = self._calendars._getEvents(playerCal)
+            playerEventByTitle = dict( (x.title.text, x) for x in playerCalEvents)
+            for event in mainCalEvents:
+                title = event.title.text
+                if title not in playerEventByTitle:
+                    email = playerCalEmails[player]
+                    toAdd.append([event, email])
+                    for i, who in enumerate(event.who):
+                        if who.email == email:
+                            event.who.pop(i)
+                            break
+                    else:
+                        raise CalendarError("Could not find invitee with email %s in %s" % (email, event.title.text))
+                    self._calendars._UpdateEvent(event, batchFeed=removeInvitesBatch)
+        batchUri = self._calendars._getCalFeedUri(allCal, batch=True)
+        self._calendars.cal_client.ExecuteBatch(removeInvitesBatch, batchUri)
+        
+        # Now that we've removed the malfunctioning invitees, go back and
+        # add them in, one by one (not in batch, to ensure they get added
+        # properly)
+        for event, email in toAdd:
+            print "re-adding %s to %s" % (email, event.title.text)
+            event.who.append(gdata.data.Who(email=email))
+            self._calendars._UpdateEvent(event)
+        return bool(toAdd)
+        
+    def _getAllCalendar(self, clear=False):
         cal = self._calendars._calTitleToObj(self.CALENDAR_TITLE)
         if cal is not None:
             if clear:
@@ -1114,12 +1151,12 @@ class ScheduleMaker(object):
             return cal
         return self._createAllCalendar()
 
-    def _createAllCalendar(self, clear=True):
+    def _createAllCalendar(self):
         return self._calendars._InsertCalendar(self.CALENDAR_TITLE,
                                                description='Schedule of matches for the Luma Table Tennis League',
                                                location='Santa Monica')
 
-    def _getPlayerCalendars(self, clear=True):
+    def _getPlayerCalendars(self, clear=False):
         calendars = {}
         for player in self.getRoster():
 #            if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
@@ -1127,7 +1164,7 @@ class ScheduleMaker(object):
             calendars[player] = self._getPlayerCalendar(player, clear=clear)
         return calendars
 
-    def _getPlayerCalendar(self, player, clear=True):
+    def _getPlayerCalendar(self, player, clear=False):
         title = '%s (%s)' % (self.CALENDAR_TITLE, player)
         cal = self._calendars._calTitleToObj(title)
         if cal is not None:
@@ -1231,18 +1268,40 @@ class CalendarInterface(object):
         return self._getEvents(cal, q=query)
 
     def _clearEvents(self, cal):
+        print "clearing events from %s" % cal.title.text
         while True:
             batchFeed = gdata.calendar.data.CalendarEventFeed()
             events = self._getEvents(cal)
             if not events:
                 break
             for event in events:
-                event.batch_id = gdata.data.BatchId(text='delete-request')
                 # add the delete entry to the batch feed
-                batchFeed.AddDelete(entry=event)
-                #self.cal_client.Delete(event.GetEditLink().href)
+                self._RemoveEvent(event, batchFeed=batchFeed,
+                                  batchId='delete-request')
             batchUri = self._getCalFeedUri(cal, batch=True)
             self.cal_client.ExecuteBatch(batchFeed, batchUri)
+            
+    def _RemoveEvent(self, event, batchFeed=None, batchId=None):
+        if batchId is None:
+            batchId = 'remove-event'
+        if not isinstance(batchId, gdata.data.BatchId):
+            batchId = gdata.data.BatchId(text=batchId)
+        event.batch_id = batchId
+        if batchFeed:
+            batchFeed.AddDelete(entry=event)
+        else:
+            self.cal_client.Delete(event.GetEditLink().href)
+
+    def _UpdateEvent(self, event, batchFeed=None, batchId=None):
+        if batchFeed:
+            if batchId is None:
+                batchId = 'update-event'
+            if not isinstance(batchId, gdata.data.BatchId):
+                batchId = gdata.data.BatchId(text=batchId)
+            event.batch_id = batchId
+            batchFeed.AddUpdate(entry=event)
+        else:
+            self.cal_client.Update(event)
 
     def _InsertEvent(self, title, calendar=None,
                      content=None, where=None,
@@ -1317,6 +1376,16 @@ class CalendarInterface(object):
         print '\tEvent edit URL: %s' % (new_event.GetEditLink().href,)
         print '\tEvent HTML URL: %s' % (new_event.GetHtmlLink().href,)
         return new_event
+    
+    def _RemoveInvitee(self, event, email, batchFeed=None, batchId=None):
+        if batchFeed:
+            if batchId is None:
+                batchId = 'remove-initee'
+            if not isinstance(batchId, gdata.data.BatchId):
+                batchId = gdata.data.BatchId(text=batchId)
+            event.batch_id = batchId
+            
+        
 
 if __name__ == '__main__':
     # run a test

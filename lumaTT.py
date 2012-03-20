@@ -414,11 +414,11 @@ class ScheduleMaker(object):
                 weekday = currentDate.weekday()
                 # weekdays start with monday=0, so friday=4
                 if weekday <= 4:
-                    slots.append(DayData(currentDate))
                     slots.append(DayData(currentDate,
                                              minGames=self.GAMES_PER_LUNCH,
                                              maxGames=self.GAMES_PER_LUNCH,
                                              group='lunch'))
+                    slots.append(DayData(currentDate))
 
                     if weekday == leagueNight:
                         slots.append(DayData(currentDate,
@@ -657,6 +657,7 @@ class ScheduleMaker(object):
                             # The + 1 is to account for the currentDay
                             totalRemainingPlusOnes = len(possiblePlusOnes) + 1
                             remainingOptionalPlusOnes = totalRemainingPlusOnes - remainingMandatoryPlusOnes
+                            lastSlotOfDay = remainingSlots[-1].date != currentDay.date
 
                             if not extraPlusOnes:
                                 usePlusOne = False
@@ -664,12 +665,12 @@ class ScheduleMaker(object):
                                 # we don't have enough slots left NOT to use
                                 # our +1s!
                                 usePlusOne = True
-                            elif not matchesLeft:
+                            elif not matchesLeft and lastSlotOfDay:
                                 # if there are no matchesLeft, then not using
                                 # a +1 means we will end the round "exactly"
                                 # on a day - a good thing! don't use the +1
                                 usePlusOne = False
-                            elif matchesLeft == 1:
+                            elif matchesLeft == 1 and lastSlotOfDay:
                                 # conversely, if there is exactly one match
                                 # left, then using the +1 would end the
                                 # round exactly on the day
@@ -1084,24 +1085,31 @@ class ScheduleMaker(object):
 #                    if player not in ('Paul Molodowitch', 'Jason Fittipaldi'):
 #                        continue
                     invitees.append(playerCalEmails[player])
-                title = '%s vs %s (R%d)' % (match.player1, match.player2, match.round)
+                if match.slot.group:
+                    group = ' (%s)' % match.slot.group
+                else:
+                    group = ''
+                title = '%s vs %s (R%d)%s' % (match.player1, match.player2, match.round, group)
                 self._calendars._InsertEvent(title,
-                                             content='Round %d matchup between %s and %s' % (match.round, match.player1, match.player2),
+                                             content='Round %d matchup between %s and %s%s' % (match.round, match.player1, match.player2, group),
                                              start_time=start_time,
                                              end_time=end_time,
                                              guests_can_modify=True,
                                              invitees=invitees,
+                                             setBusy=False,
                                              batchFeed=allBatchFeed)
 
         allBatchUri = self._calendars._getCalFeedUri(allCal, batch=True)
+        print "Adding all matches to master calendar..."
         self._calendars.cal_client.ExecuteBatch(allBatchFeed, allBatchUri)
 
+        print "Fixing missing invites in player calendars..."
         self.fixMissingInvites()
-    
+
     def fixMissingInvites(self):
         while(self._fixMissingInvites()):
             pass
-    
+
     def _fixMissingInvites(self):
         allCal = self._getAllCalendar()
         playerCals = self._getPlayerCalendars()
@@ -1133,7 +1141,7 @@ class ScheduleMaker(object):
                     self._calendars._UpdateEvent(event, batchFeed=removeInvitesBatch)
         batchUri = self._calendars._getCalFeedUri(allCal, batch=True)
         self._calendars.cal_client.ExecuteBatch(removeInvitesBatch, batchUri)
-        
+
         # Now that we've removed the malfunctioning invitees, go back and
         # add them in, one by one (not in batch, to ensure they get added
         # properly)
@@ -1142,7 +1150,7 @@ class ScheduleMaker(object):
             event.who.append(gdata.data.Who(email=email))
             self._calendars._UpdateEvent(event)
         return bool(toAdd)
-        
+
     def _getAllCalendar(self, clear=False):
         cal = self._calendars._calTitleToObj(self.CALENDAR_TITLE)
         if cal is not None:
@@ -1280,7 +1288,7 @@ class CalendarInterface(object):
                                   batchId='delete-request')
             batchUri = self._getCalFeedUri(cal, batch=True)
             self.cal_client.ExecuteBatch(batchFeed, batchUri)
-            
+
     def _RemoveEvent(self, event, batchFeed=None, batchId=None):
         if batchId is None:
             batchId = 'remove-event'
@@ -1308,6 +1316,7 @@ class CalendarInterface(object):
                      start_time=None, end_time=None, recurrence_data=None,
                      guests_can_modify=False,
                      invitees=None,
+                     setBusy=True,
                      batchFeed=None, batchId=None):
         """Inserts a basic event using either start_time/end_time definitions
         or gd:recurrence RFC2445 icalendar syntax.  Specifying both types of
@@ -1348,6 +1357,8 @@ class CalendarInterface(object):
                 if not isinstance(invitee, gdata.data.Who):
                     invitee = gdata.data.Who(email=invitee)
                 event.who.append(invitee)
+        if not setBusy:
+            event.transparency = gdata.data.Transparency(value=gdata.data.TRANSPARENT_EVENT)
 
         if batchFeed:
             if calendar is not None:
@@ -1376,7 +1387,7 @@ class CalendarInterface(object):
         print '\tEvent edit URL: %s' % (new_event.GetEditLink().href,)
         print '\tEvent HTML URL: %s' % (new_event.GetHtmlLink().href,)
         return new_event
-    
+
     def _RemoveInvitee(self, event, email, batchFeed=None, batchId=None):
         if batchFeed:
             if batchId is None:
@@ -1384,8 +1395,8 @@ class CalendarInterface(object):
             if not isinstance(batchId, gdata.data.BatchId):
                 batchId = gdata.data.BatchId(text=batchId)
             event.batch_id = batchId
-            
-        
+
+
 
 if __name__ == '__main__':
     # run a test
